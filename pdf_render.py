@@ -18,6 +18,7 @@ from __future__ import annotations
 import html
 import re
 import shutil
+import os
 import subprocess
 from pathlib import Path
 
@@ -31,14 +32,7 @@ LIGHT = "#71717a"
 LINE = "#e4e7ec"
 CHIPBG = "#eef4f7"
 
-_CHROME = [
-    "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome",
-    "/Applications/Chromium.app/Contents/MacOS/Chromium",
-    shutil.which("google-chrome"),
-    shutil.which("chromium"),
-    shutil.which("chrome"),
-]
-
+_CHROME = [ r"C:\Program Files\Google\Chrome\Application\chrome.exe", r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe", str(Path(os.environ.get("LOCALAPPDATA", "")) / "Google" / "Chrome" / "Application" / "chrome.exe"), "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium", shutil.which("google-chrome"), shutil.which("chromium"), shutil.which("chrome"), ]
 
 def _chrome() -> str:
     for c in _CHROME:

@@ -1,16 +1,10 @@
 """Local LLM client for the offline drafting MVP.
 
-Talks to an OpenAI-compatible local endpoint (LM Studio by default, on :1234)
-using the **raw** ``/v1/completions`` endpoint with a hand-built qwen ChatML
-prompt. A pre-closed ``<think></think>`` block is prefilled into the assistant
-turn, which stops the reasoning-model from burning its whole token budget
-thinking (LM Studio ignores the API-level thinking switches — ``/no_think``,
-``enable_thinking:false`` and ``response_format`` all leave ``content`` empty).
-That prefill turns a 40-70s empty response into a ~9s clean, parseable one.
-
-Dependency-light on purpose: stdlib ``urllib`` only, so it drops into the
-project's existing venv without new installs. Model-agnostic via ``model`` /
-``base_url`` (qwen family shares the ChatML template, so Ollama qwen works too).
+Talks to an OpenAI-compatible local endpoint using the standard
+``/v1/chat/completions`` endpoint, so the server (Ollama, LM Studio, etc.)
+applies its own correct chat template internally instead of us hand-building
+one. This keeps things portable across models/backends without needing to
+match a specific model's special-token format.
 """
 
 from __future__ import annotations
@@ -25,23 +19,14 @@ from urllib.parse import urlparse
 
 DEFAULT_BASE_URL = "http://localhost:1234/v1"
 DEFAULT_MODEL = "qwen/qwen3.6-27b"
-STOP = "<|im_end|>"
 
 # Preference order when more than one usable model is offered. Substring match
-# against the id (case-insensitive), so "qwen/qwen3.6-27b" etc. all match.
-RECOMMENDED_MODELS = ("qwen3.6-27b", "qwen3.5-9b")
+# against the id (case-insensitive).
+RECOMMENDED_MODELS = ("qwen3.6-27b", "qwen3.5-9b", "qwen2.5")
 
 
 def resolve_model(available: list[str], preferred: str | None = None) -> str | None:
-    """Pick which model id to use from what the endpoint currently offers.
-
-    Supports the "load one model in LM Studio, the app just uses it" workflow:
-    with exactly one non-embedding model offered, that one is used regardless
-    of name. An explicit ``preferred`` id (e.g. a pinned CVDRAFTER_LLM_MODEL)
-    wins if it is still offered. With several models offered and no pin, the
-    recommended qwen models are preferred in order. Returns None when nothing
-    usable is offered (endpoint down, or only embedding models loaded).
-    """
+    """Pick which model id to use from what the endpoint currently offers."""
     if preferred and preferred in available:
         return preferred
     usable = [m for m in available if "embed" not in m.lower()]
@@ -65,9 +50,7 @@ class LocalLLM:
     timeout: int = 180
     temperature: float = 0.0
 
-    # -- connectivity ------------------------------------------------------ #
     def is_up(self, connect_timeout: float = 1.5) -> bool:
-        """True if something is listening on the endpoint's host/port."""
         parsed = urlparse(self.base_url)
         host, port = parsed.hostname or "localhost", parsed.port or 80
         try:
@@ -77,22 +60,6 @@ class LocalLLM:
             return False
 
     def list_loaded_models(self, connect_timeout: float = 2.0) -> list[str] | None:
-        """Model ids LM Studio currently has LOADED in memory, or None if unknown.
-
-        The plain OpenAI-compatible /v1/models (list_models below) lists every
-        DOWNLOADED model regardless of load state, which is not enough to tell
-        a loaded model apart from one merely on disk: with two qwen models
-        downloaded and only one loaded, list_models still shows both, and
-        auto-detection can pick the unloaded one, which then fails to JIT-load
-        if the loaded one is already using the available memory. LM Studio's
-        own extended REST API carries a real ``state`` field, so this is used
-        in preference to list_models when available.
-
-        Returns None (not an empty list) when this endpoint does not exist
-        (a non-LM-Studio backend, or an old LM Studio version) so the caller
-        can fall back to list_models rather than reading "nothing loaded"
-        from a backend that simply does not support this endpoint.
-        """
         parsed = urlparse(self.base_url)
         root = f"{parsed.scheme}://{parsed.netloc}"
         try:
@@ -107,12 +74,6 @@ class LocalLLM:
         )
 
     def list_models(self, connect_timeout: float = 2.0) -> list[str]:
-        """Model ids the endpoint currently offers (empty list on any failure).
-
-        LM Studio lists every downloaded model here and loads the requested one
-        on demand, so "offered" is the honest word rather than "loaded". Prefer
-        list_loaded_models() when you need to know what is actually resident.
-        """
         try:
             req = urllib.request.Request(f"{self.base_url}/models")
             with urllib.request.urlopen(req, timeout=connect_timeout) as resp:
@@ -121,33 +82,23 @@ class LocalLLM:
             return []
         return sorted(str(m.get("id")) for m in body.get("data", []) if m.get("id"))
 
-    # -- prompt build ------------------------------------------------------ #
-    @staticmethod
-    def build_prompt(system: str, user: str, prefill: str = "") -> str:
-        """qwen ChatML with an assistant turn whose think block is pre-closed.
-
-        ``prefill`` seeds the start of the answer (e.g. ``{`` to force JSON), a
-        reliable way to stop a small model wandering into prose on longer tasks.
-        """
-        return (
-            f"<|im_start|>system\n{system.strip()}{STOP}\n"
-            f"<|im_start|>user\n{user.strip()}{STOP}\n"
-            f"<|im_start|>assistant\n<think>\n\n</think>\n\n{prefill}"
-        )
-
-    # -- raw completion ---------------------------------------------------- #
     def complete_text(
         self, system: str, user: str, max_tokens: int = 800, prefill: str = ""
     ) -> str:
+        content = user.strip()
+        if prefill:
+            content += f"\n\n(Begin your reply with exactly: {prefill})"
         payload = {
             "model": self.model,
-            "prompt": self.build_prompt(system, user, prefill),
+            "messages": [
+                {"role": "system", "content": system.strip()},
+                {"role": "user", "content": content},
+            ],
             "temperature": self.temperature,
             "max_tokens": max_tokens,
-            "stop": [STOP],
         }
         req = urllib.request.Request(
-            f"{self.base_url}/completions",
+            f"{self.base_url}/chat/completions",
             data=json.dumps(payload).encode("utf-8"),
             headers={"Content-Type": "application/json"},
         )
@@ -155,9 +106,6 @@ class LocalLLM:
             with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                 body = json.loads(resp.read().decode("utf-8"), strict=False)
         except urllib.error.HTTPError as exc:
-            # The endpoint answered with an error: surface its body, which is
-            # where LM Studio explains itself (e.g. "insufficient system
-            # resources" when another loaded model is hogging the memory).
             try:
                 detail = exc.read().decode("utf-8", "replace")[:300]
             except OSError:
@@ -167,18 +115,11 @@ class LocalLLM:
             ) from exc
         except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
             raise LocalLLMError(f"local endpoint unreachable at {self.base_url}: {exc}") from exc
-        return (body["choices"][0].get("text") or "").strip()
+        return (body["choices"][0]["message"].get("content") or "").strip()
 
-    # -- json helper ------------------------------------------------------- #
     def complete_json(
         self, system: str, user: str, max_tokens: int = 900, retries: int = 2
     ) -> dict:
-        """Return a parsed JSON object; prefill ``{`` and retry on bad output.
-
-        The assistant turn is seeded with ``{`` so the model must continue a JSON
-        object rather than drift into prose. Both the raw text and a ``{``-prepended
-        variant are tried, covering models that echo the brace and those that don't.
-        """
         sys_prompt = system
         last_err: Exception | None = None
         for _ in range(retries + 1):
